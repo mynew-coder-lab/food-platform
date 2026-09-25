@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 
+    redis_url: str
+
     # --- Time-based inventory management (food waste reduction) ---
     # How far ahead of a food item's `available_until` window it gets flagged
     # as a "quick-access" listing so it gets surfaced/sold before it expires.
