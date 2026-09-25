@@ -5,9 +5,13 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
 
 from app.core.database import get_connection
+from app.core.redis import redis_client
 from app.vendors.dependencies import get_current_vendor
 from app.food_items.models import FoodItemStatus, food_items
 from app.food_items.schemas import FoodItemCreate, FoodItemOut, FoodItemUpdate
+import json
+
+CACHE_KEY_MENU = "menu:available_items"
 
 router = APIRouter(prefix="/food-items", tags=["food-items"])
 
@@ -30,6 +34,10 @@ def create_food_item(
         )
     )
     new_id = result.inserted_primary_key[0]
+    
+    # [REDIS] Invalidate cache because menu changed!
+    redis_client.delete(CACHE_KEY_MENU)
+    
     return dict(conn.execute(select(food_items).where(food_items.c.id == new_id)).mappings().first())
 
 
@@ -39,13 +47,28 @@ def list_food_items(
     quick_access: Optional[bool] = None,
     conn: Connection = Depends(get_connection),
 ):
+    # [REDIS] Only cache the default menu (no filters)
+    if vendor_id is None and quick_access is None:
+        cached_menu = redis_client.get(CACHE_KEY_MENU)
+        if cached_menu:
+            return json.loads(cached_menu)
+
     query = select(food_items).where(food_items.c.status == FoodItemStatus.active)
     if vendor_id is not None:
         query = query.where(food_items.c.vendor_id == vendor_id)
     if quick_access is not None:
         query = query.where(food_items.c.is_quick_access.is_(quick_access))
     rows = conn.execute(query.order_by(food_items.c.available_until.asc().nulls_last())).mappings().all()
-    return [dict(r) for r in rows]
+    results = [dict(r) for r in rows]
+
+    # [REDIS] Save to cache for 60 seconds
+    if vendor_id is None and quick_access is None:
+        def default_serializer(obj):
+            if hasattr(obj, 'isoformat'): return obj.isoformat()
+            return str(obj)
+        redis_client.set(CACHE_KEY_MENU, json.dumps(results, default=default_serializer), ex=60)
+
+    return results
 
 
 @router.get("/quick-access", response_model=list[FoodItemOut])
@@ -84,6 +107,8 @@ def update_food_item(
     updates = payload.model_dump(exclude_unset=True)
     if updates:
         conn.execute(update(food_items).where(food_items.c.id == food_item_id).values(**updates))
+        # [REDIS] Invalidate cache
+        redis_client.delete(CACHE_KEY_MENU)
 
     return dict(conn.execute(select(food_items).where(food_items.c.id == food_item_id)).mappings().first())
 
@@ -101,3 +126,6 @@ def remove_food_item(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your food item")
 
     conn.execute(update(food_items).where(food_items.c.id == food_item_id).values(status=FoodItemStatus.removed))
+    
+    # [REDIS] Invalidate cache
+    redis_client.delete(CACHE_KEY_MENU)
