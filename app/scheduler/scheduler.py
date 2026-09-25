@@ -5,16 +5,28 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.core.config import settings
 from app.core.database import engine
 from app.scheduler import inventory_tasks, order_lifecycle_tasks
+from app.core.redis import redis_client
 
 logger = logging.getLogger("scheduler")
 
 scheduler = BackgroundScheduler()
 
+LOCK_KEY = "scheduler:maintenance_cycle_lock"
+LOCK_TIMEOUT = 50  # Seconds the lock is held (must be slightly less than the scheduler interval)
 
 def _run_maintenance_cycle() -> None:
-    """Single periodic pass that drives both automated workflows:
-    1) time-based inventory management (quick-access flags / expiry), and
-    2) order-transfer window flagging / unclaimed-order expiry."""
+    """Single periodic pass that drives both automated workflows.
+    We use a Redis Distributed Lock (SETNX) so that if 4 servers try to run
+    this exactly at the same time, only the first one gets the lock and executes it.
+    """
+    # Attempt to acquire the lock. nx=True means "Set ONLY IF Not eXists".
+    # This is an atomic operation in Redis—impossible for a race condition to bypass it.
+    acquired = redis_client.set(LOCK_KEY, "locked", nx=True, ex=LOCK_TIMEOUT)
+    if not acquired:
+        logger.info("Maintenance cycle already running on another worker. Skipping.")
+        return
+
+    logger.info("Lock acquired. Running maintenance cycle...")
     with engine.connect() as conn:
         trans = conn.begin()
         try:
